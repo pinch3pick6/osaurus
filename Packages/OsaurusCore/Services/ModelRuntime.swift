@@ -135,6 +135,33 @@ public actor ModelRuntime {
             holder.container.disableCaching()
         }
 
+        // ORDER IS LOad-BEARING: synchronize BEFORE releasing the container.
+        //
+        // `modelCache.removeValue` drops the last retain on `SessionHolder`,
+        // which chain-releases its `ModelContainer` — and with it any
+        // `MTLComputePipelineState` objects the model was using. Metal
+        // enforces the invariant that a pipeline outlives every command
+        // buffer that references it; violating this trips the assertion
+        //
+        //   -[MTLDebugDevice notifyExternalReferencesNonZeroOnDealloc:]:
+        //   "The following Metal object is being destroyed while still
+        //    required to be held by the command buffer"
+        //
+        // …which aborts the whole process. The lease drain above only
+        // proves that no more Swift-level readers are iterating our
+        // stream — it does NOT prove that the BatchEngine's last MLX
+        // forward pass has already committed its command buffer. A GPU
+        // sync is the only correct fence here.
+        //
+        // Historically `Stream.gpu.synchronize()` was called AFTER
+        // `removeValue` (see pre-fix git history). That worked by luck
+        // when the caller had just finished consuming a completed stream
+        // (generation naturally drained before unload started), but it
+        // crashed whenever a client disconnected mid-generation and
+        // cancellation raced eviction — exactly the scenario exercised
+        // by `scripts/eval_http_stability.py --only S4`.
+        Stream.gpu.synchronize()
+
         autoreleasepool {
             _ = modelCache.removeValue(forKey: name)
         }
@@ -143,7 +170,6 @@ public actor ModelRuntime {
         if currentModelName == name { currentModelName = nil }
 
         Memory.cacheLimit = mlxCacheLimit()
-        Stream.gpu.synchronize()
         Memory.clearCache()
     }
 
@@ -176,6 +202,14 @@ public actor ModelRuntime {
             holder.container.disableCaching()
         }
 
+        // GPU sync MUST precede the container release — see the detailed
+        // comment in `unload(name:)` for the Metal invariant. The same
+        // reasoning applies verbatim here: dropping `modelCache` refs
+        // before syncing can free a pipeline that a still-committed
+        // command buffer references, which aborts the process via the
+        // `notifyExternalReferencesNonZeroOnDealloc` assertion.
+        Stream.gpu.synchronize()
+
         autoreleasepool {
             modelCache.removeAll()
         }
@@ -189,7 +223,6 @@ public actor ModelRuntime {
         // in one place if the heuristic ever picks a non-zero floor for
         // the idle case.
         Memory.cacheLimit = mlxCacheLimit()
-        Stream.gpu.synchronize()
         Memory.clearCache()
     }
 

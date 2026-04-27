@@ -18,10 +18,17 @@ extension HTTPHandler {
     /// channel's event loop, no-oping when the channel is no longer
     /// active. Every per-request `Task` captures `let hop = makeHop(...)`
     /// once and uses it to write back to the wire safely.
+    ///
+    /// The returned function is marked `@Sendable` so it can be captured
+    /// by the Task closures that `launchRequestTask` spawns. `Channel` and
+    /// `EventLoop` are both already `Sendable` (the captures that make
+    /// this closure sound), so no runtime change is needed — only the
+    /// type annotation, which Swift 6 strict concurrency requires in order
+    /// to let `@Sendable` Task bodies capture `hop` without diagnostics.
     static func makeHop(
         channel: Channel,
         loop: EventLoop
-    ) -> (@escaping @Sendable () -> Void) -> Void {
+    ) -> @Sendable (@escaping @Sendable () -> Void) -> Void {
         { block in
             guard channel.isActive else { return }
             if loop.inEventLoop { block() } else { loop.execute { block() } }

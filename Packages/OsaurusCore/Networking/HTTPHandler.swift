@@ -53,6 +53,27 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
     }
     let stateRef: NIOLoopBound<RequestState>
 
+    /// Mutable slot for the `Task` currently serving this connection.
+    ///
+    /// Wrapped in a class so `NIOLoopBound<CurrentTaskSlot>` can vend the
+    /// same reference back and mutation works through it — `NIOLoopBound`'s
+    /// `value` is `let`-only for value types, and we need to rebind the
+    /// slot from both `launchRequestTask` and `channelInactive`.
+    final class CurrentTaskSlot {
+        var task: Task<Void, Never>?
+    }
+
+    /// Holds the Task currently serving this connection's request, if any.
+    ///
+    /// Set by `launchRequestTask` when a route spawns an async worker;
+    /// cleared when the worker finishes or the channel goes inactive. Only
+    /// touched from the channel's event loop (that's the point of the
+    /// `NIOLoopBound` wrapper), so no lock is needed. On `channelInactive`
+    /// we cancel whatever is still here as defense-in-depth; the primary
+    /// cancellation path is `channel.closeFuture` wired in
+    /// `launchRequestTask` itself.
+    let currentTaskRef: NIOLoopBound<CurrentTaskSlot>
+
     init(
         configuration: ServerConfiguration,
         apiKeyValidator: APIKeyValidator = .empty,
@@ -65,6 +86,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         self.chatEngine = chatEngine
         self.trustLoopback = trustLoopback
         self.stateRef = NIOLoopBound(RequestState(), eventLoop: eventLoop)
+        self.currentTaskRef = NIOLoopBound(CurrentTaskSlot(), eventLoop: eventLoop)
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -74,6 +96,15 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
 
     func channelInactive(context: ChannelHandlerContext) {
         _isChannelActive.value = false
+        // Belt-and-braces: `launchRequestTask` already wires cancellation to
+        // `channel.closeFuture`, but if `channelInactive` fires before that
+        // wire takes effect, also cancel here. A cancelled Task whose body
+        // has already finished is a no-op.
+        let slot = currentTaskRef.value
+        if let task = slot.task {
+            task.cancel()
+            slot.task = nil
+        }
         context.fireChannelInactive()
     }
 
@@ -2088,7 +2119,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
 
         hop { writerBound.value.writeHeaders(ctx.value, extraHeaders: cors) }
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             // Resolve model: client sends "default" when no specific model was known
             let model: String
             if req.model.isEmpty || req.model == "default" {
@@ -2396,7 +2427,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         }
         let agentIdentifier = String(components[1])
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             // Resolve identifier: try UUID first, then crypto address
             guard let agentId = await MainActor.run(body: { AgentManager.shared.resolveAgentId(agentIdentifier) })
             else {
@@ -2973,7 +3004,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
                 loop: loop,
                 ctx: ctx
             )
-            Task(priority: .userInitiated) {
+            launchRequestTask(on: context.channel) {
                 defer { keepaliveTask.cancel() }
                 do {
                     let chatEngine = self.chatEngine
@@ -3214,7 +3245,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
             let logTemperature = req.temperature ?? 0.7
             let logMaxTokens = req.max_tokens ?? 1024
             let logSelf = self
-            Task(priority: .userInitiated) {
+            launchRequestTask(on: context.channel) {
                 do {
                     let chatEngine = self.chatEngine
                     let enrichedReq = await Self.enrichWithAgentContext(req, agentId: memoryAgentId)
@@ -3396,7 +3427,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         let logTemperature = req.temperature ?? 0.7
         let logMaxTokens = req.max_tokens ?? 1024
         let logSelf = self
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             do {
                 let chatEngine = self.chatEngine
                 let stream = try await chatEngine.streamChat(request: req)
@@ -3478,7 +3509,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         loop: EventLoop,
         ctx: NIOLoopBound<ChannelHandlerContext>
     ) -> Task<Void, Never> {
-        Task<Void, Never>(priority: .background) {
+        let task = Task<Void, Never>(priority: .background) {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 15_000_000_000)
                 if Task.isCancelled { return }
@@ -3486,6 +3517,15 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
                 loop.execute { writer.value.writePing(ctx.value) }
             }
         }
+        // Producer's `defer { keepaliveTask.cancel() }` already covers the
+        // normal-exit case. This wiring covers the abnormal one: client slams
+        // the TCP connection closed, `channelInactive` fires, the producer
+        // cancellation chain starts — but the keepalive's 15s sleep would
+        // otherwise stall before the `channel.isActive` check on the next
+        // tick. Tying to `closeFuture` makes cancellation immediate and stops
+        // the sleep from retaining `channel` / `ctx` past channel teardown.
+        channel.closeFuture.whenComplete { _ in task.cancel() }
+        return task
     }
 
     // MARK: - Tool batch execution
@@ -4407,7 +4447,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         let logModel = model
         let logSelf = self
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             do {
                 let chatEngine = self.chatEngine
                 let stream = try await chatEngine.streamChat(request: internalReq)
@@ -4528,7 +4568,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         let logModel = model
         let logSelf = self
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             do {
                 let chatEngine = self.chatEngine
                 let resp = try await chatEngine.completeChat(request: internalReq)
@@ -4714,6 +4754,51 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
     private func executeOnLoop(_ loop: EventLoop, _ block: @escaping @Sendable () -> Void) {
         guard _isChannelActive.value else { return }
         if loop.inEventLoop { block() } else { loop.execute { block() } }
+    }
+
+    /// Launch an async worker that serves the current request and ensure the
+    /// worker is cancelled the instant the NIO channel closes.
+    ///
+    /// Why this exists: every chat-style route used to call
+    /// `Task(priority: .userInitiated) { ... }` and then forget the handle.
+    /// When a client disconnected mid-stream the server kept generating
+    /// tokens through the full MLX pipeline — holding a `ModelLease` the
+    /// whole time, which blocked the next request's `strictSingleModel`
+    /// eviction and (worse) opened a race where Metal resources could be
+    /// freed while a command buffer still referenced them, tripping
+    /// `notifyExternalReferencesNonZeroOnDealloc`.
+    ///
+    /// `channel.closeFuture` fires exactly once when the channel is fully
+    /// closed (post `channelInactive`). Cancelling the task there
+    /// propagates all the way down through `ChatEngine.streamChat` →
+    /// `ModelRuntime.streamWithTools` → the producer task that holds the
+    /// lease, so the lease releases promptly. The handler's
+    /// `channelInactive` also cancels the slot as an independent belt.
+    ///
+    /// The helper assumes it is called from the channel's event loop (that
+    /// is where `channelRead` → the route dispatch runs), which is why the
+    /// slot write is unlocked. Use `executeOnLoop` to hop back first if
+    /// you are ever calling from a different context.
+    func launchRequestTask(
+        on channel: Channel,
+        _ body: @escaping @Sendable () async -> Void
+    ) {
+        let taskRef = currentTaskRef
+        let task = Task(priority: .userInitiated) {
+            await body()
+            // Clear the slot on the event loop once the worker finishes,
+            // so a late `channelInactive` doesn't try to cancel a
+            // reference to a completed Task (cheap no-op, but this
+            // keeps the slot honest and avoids retaining the Task).
+            let loop = taskRef.eventLoop
+            if loop.inEventLoop {
+                taskRef.value.task = nil
+            } else {
+                loop.execute { taskRef.value.task = nil }
+            }
+        }
+        taskRef.value.task = task
+        channel.closeFuture.whenComplete { _ in task.cancel() }
     }
 
     // MARK: - Audio Transcriptions (OpenAI Whisper API Compatible)
@@ -5045,7 +5130,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         // the concurrent closures that read/mutate the flag.
         let messageItemOpen = AtomicBoolBox()
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             do {
                 let chatEngine = self.chatEngine
                 let stream = try await chatEngine.streamChat(request: internalReq)
@@ -5365,7 +5450,7 @@ final class HTTPHandler: ChannelInboundHandler, Sendable {
         let logModel = model
         let logSelf = self
 
-        Task(priority: .userInitiated) {
+        launchRequestTask(on: context.channel) {
             do {
                 let chatEngine = self.chatEngine
                 let resp = try await chatEngine.completeChat(request: internalReq)
