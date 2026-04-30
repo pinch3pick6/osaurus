@@ -71,6 +71,20 @@ public enum OsaurusPaths {
         root().appendingPathComponent("agents", isDirectory: true)
     }
 
+    /// Per-agent invite ledger directory (one JSON file per agent).
+    /// Sibling of `agents()` so `AgentStore` doesn't try to decode the
+    /// ledger files as agent records.
+    public static func agentInvites() -> URL {
+        root().appendingPathComponent("agent-invites", isDirectory: true)
+    }
+
+    /// Remote (paired) agents that the receiver has added from someone else's
+    /// share link. Distinct from `agents()` — those are the local agents
+    /// this device owns and signs for.
+    public static func remoteAgents() -> URL {
+        root().appendingPathComponent("remote-agents", isDirectory: true)
+    }
+
     /// Themes directory
     public static func themes() -> URL {
         root().appendingPathComponent("themes", isDirectory: true)
@@ -266,6 +280,7 @@ public enum OsaurusPaths {
     public static func toastConfigFile() -> URL { config().appendingPathComponent("toast.json") }
     public static func sandboxConfigFile() -> URL { config().appendingPathComponent("sandbox.json") }
     public static func speechConfigFile() -> URL { voiceConfig().appendingPathComponent("speech.json") }
+    public static func ttsConfigFile() -> URL { voiceConfig().appendingPathComponent("tts.json") }
     public static func vadConfigFile() -> URL { voiceConfig().appendingPathComponent("vad.json") }
     public static func transcriptionConfigFile() -> URL { voiceConfig().appendingPathComponent("transcription.json") }
     public static func remoteProviderConfigFile() -> URL { providers().appendingPathComponent("remote.json") }

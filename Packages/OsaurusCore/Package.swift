@@ -17,9 +17,29 @@ let package = Package(
         // Pinned by commit (was `branch: "main"`) so the runtime can't change
         // under us between identical osaurus source revisions. Bump
         // intentionally when validating a new upstream commit.
+        //
+        // a7db6e5 closes the deterministic Metal-assertion crash class
+        // `notifyExternalReferencesNonZeroOnDealloc` inside
+        // `BatchEngine.stepPrefill` after `Cache disk hit`. Two upstream
+        // commits land that fix together:
+        //   - 98289d9 forces `MLX.asyncEval(slot.cache)` after disk
+        //     restore so lazy-restore graph ops don't extend into the
+        //     next request's command buffer.
+        //   - a7db6e5 sets `continuation.onTermination` on
+        //     `BatchEngine.generate`'s outStream so orphan slots get
+        //     reaped via `engine.cancel(requestId)` whenever a consumer
+        //     breaks early.
+        // Net effect: the `Task.isCancelled` break in MLXBatchAdapter
+        // line 209-222 is safe, and no `enableDiskCache: false` workaround
+        // is needed.
+        //
+        // Also includes c992df9's `GenerateCompletionInfo.unclosedReasoning`,
+        // which the chat UI consumes to surface a "thinking didn't close"
+        // chip when reasoning-trained models trap themselves on validation
+        // prompts.
         .package(
             url: "https://github.com/osaurus-ai/vmlx-swift-lm",
-            revision: "070dc5b8c9829dc69b6e4831dd201537200a9c36"
+            revision: "a7db6e5fdde525c43f72ba48df8ba12a07451ee9"
         ),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.14.0"),
@@ -54,24 +74,31 @@ let package = Package(
         //     Swift's Clang importer sees two different definitions
         //     of those typedefs and rejects the build with
         //         'Fts5ExtensionApi' has different definitions in different modules
-        //     The fix is two-part:
+        //     The fix is three-part:
         //       1. `include/sqlite3.h` wraps the `_FTS5_H` block in
         //          `#ifndef OSAURUS_OMIT_FTS5_HEADERS` (search for
         //          OSAURUS LOCAL MODIFICATION inside that file).
-        //       2. The `cSettings` `.define("OSAURUS_OMIT_FTS5_HEADERS")`
-        //          below activates the wrap.
+        //       2. `include/OsaurusSQLCipher.h` defines
+        //          `OSAURUS_OMIT_FTS5_HEADERS` before including
+        //          sqlite3.h so Swift's Clang module import sees the
+        //          hidden extension API.
+        //       3. The `cSettings` `.define("OSAURUS_OMIT_FTS5_HEADERS")`
+        //          below keeps the C compilation path aligned.
         //     `sqlite3.c` itself inlines its own copy of the header
         //     text, so FTS5's SQL-level functionality keeps working;
         //     we only hide the C-extension API, which Osaurus
         //     doesn't use.
         //     `Tests/Storage/SQLCipherVendorGuardTests.swift` asserts
-        //     both the header guard and the cSettings flag are in
-        //     place — CI fails if a SQLCipher bump strips the guard.
+        //     the header guard, umbrella define, and cSettings flag
+        //     are in place — CI fails if a SQLCipher bump strips them.
         //
-        // ⚠️  `sqlite3ext.h` struct collision. A similar issue occurs
-        //     with `struct sqlite3_api_routines` in `sqlite3ext.h`.
-        //     We wrap its contents in `#ifndef OSAURUS_OMIT_SQLITE3EXT_HEADERS`
-        //     and define it below.
+        // ⚠️  sqlite3ext.h collision. Newer macOS SDKs append fields
+        //     to `sqlite3_api_routines` before our pinned SQLCipher
+        //     adopts that SQLite version. Osaurus does not compile
+        //     SQLite loadable extensions, so the umbrella header hides
+        //     sqlite3ext.h's loadable-extension API from the Swift
+        //     Clang importer while still including the header to keep
+        //     module import warnings quiet.
         .target(
             name: "OsaurusSQLCipher",
             path: "SQLCipher",
@@ -108,12 +135,6 @@ let package = Package(
                 // copy of sqlite3.h text is unaffected, so the C
                 // compilation of FTS5 keeps working.
                 .define("OSAURUS_OMIT_FTS5_HEADERS"),
-                // Hide the `sqlite3_api_routines` struct from
-                // `include/sqlite3ext.h` so the Swift Clang importer
-                // doesn't conflict with the system SQLite3 module.
-                // `sqlite3.c`'s inlined copy of sqlite3ext.h text is
-                // unaffected.
-                .define("OSAURUS_OMIT_SQLITE3EXT_HEADERS"),
                 // The SQLite amalgamation calls a few self-references
                 // before their forward declarations show up; modern
                 // Apple clang upgrades this from a warning to an

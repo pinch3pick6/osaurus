@@ -1123,6 +1123,11 @@ final class ChatSession: ObservableObject {
                 } else if let stats = StreamingStatsHint.decode(delta) {
                     currentTurn.generationTokenCount = stats.tokenCount
                     currentTurn.generationTokensPerSecond = stats.tokensPerSecond
+                    // Vmlx tells us the model never closed `</think>` before
+                    // EOS / max_tokens. Persist on the turn so the bubble
+                    // renderer can surface a one-line banner suggesting
+                    // the user toggle Disable Thinking for this prompt class.
+                    currentTurn.unclosedReasoning = stats.unclosedReasoning
                 } else if let reasoning = StreamingReasoningHint.decode(delta) {
                     processor.receiveReasoning(reasoning)
                 } else if !delta.isEmpty {
@@ -1634,10 +1639,14 @@ final class ChatSession: ObservableObject {
                                 sessionId?.uuidString ?? "chatwindow-\(ObjectIdentifier(self).hashValue)"
                             resultText = try await ChatExecutionContext.$currentAgentId.withValue(effectiveAgentId) {
                                 try await ChatExecutionContext.$currentSessionId.withValue(sessionIdForTools) {
-                                    try await ToolRegistry.shared.execute(
-                                        name: inv.toolName,
-                                        argumentsJSON: inv.jsonArguments
-                                    )
+                                    try await ChatExecutionContext.$currentAssistantTurnId.withValue(assistantTurn.id) {
+                                        try await ChatExecutionContext.$currentToolCallId.withValue(callId) {
+                                            try await ToolRegistry.shared.execute(
+                                                name: inv.toolName,
+                                                argumentsJSON: inv.jsonArguments
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             if !isRunActive(runId) { break outer }
@@ -2477,6 +2486,7 @@ struct ChatView: View {
                     onRegenerate: regenerateTurn,
                     onEdit: beginEditingTurn,
                     onDelete: deleteTurn,
+                    onSpeak: speakTurnContent,
                     editingTurnId: editingTurnId,
                     editText: $editText,
                     onConfirmEdit: confirmEditAndRegenerate,
@@ -2588,6 +2598,7 @@ private struct IsolatedThreadView: View {
     let onRegenerate: ((UUID) -> Void)?
     let onEdit: ((UUID) -> Void)?
     let onDelete: ((UUID) -> Void)?
+    let onSpeak: ((UUID) -> Void)?
     let editingTurnId: UUID?
     let editText: Binding<String>?
     let onConfirmEdit: (() -> Void)?
@@ -2614,6 +2625,7 @@ private struct IsolatedThreadView: View {
             onRegenerate: onRegenerate,
             onEdit: onEdit,
             onDelete: onDelete,
+            onSpeak: onSpeak,
             editingTurnId: editingTurnId,
             editText: editText,
             onConfirmEdit: onConfirmEdit,
@@ -2691,6 +2703,14 @@ extension ChatView {
     /// Stable callback for regenerate action - prevents closure recreation
     private func regenerateTurn(turnId: UUID) {
         session.regenerate(turnId: turnId)
+    }
+
+    /// Read the assistant turn aloud via PocketTTS. If the model isn't downloaded,
+    /// TTSService posts a notification that opens the TTS settings tab.
+    private func speakTurnContent(turnId: UUID) {
+        guard let turn = session.turns.first(where: { $0.id == turnId }) else { return }
+        guard !turn.contentIsEmpty else { return }
+        TTSService.shared.toggleSpeak(text: turn.visibleContent, messageId: turnId)
     }
 
     /// Stop any active generation and remove the turn (plus all subsequent turns)

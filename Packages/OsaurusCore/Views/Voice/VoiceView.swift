@@ -16,6 +16,7 @@ enum VoiceTab: String, CaseIterable, AnimatedTabItem {
     case voiceInput = "Voice Input"
     case transcription = "Transcription"
     case vadMode = "VAD Mode"
+    case tts = "TTS"
     case models = "Models"
 
     var title: String { rawValue }
@@ -27,6 +28,7 @@ struct VoiceView: View {
     @ObservedObject private var themeManager = ThemeManager.shared
     @ObservedObject private var speechService = SpeechService.shared
     @ObservedObject private var modelManager = SpeechModelManager.shared
+    @ObservedObject private var managementState = ManagementStateManager.shared
 
     private var theme: ThemeProtocol { themeManager.currentTheme }
 
@@ -60,6 +62,8 @@ struct VoiceView: View {
                     TranscriptionModeSettingsTab()
                 case .vadMode:
                     VADModeSettingsTab()
+                case .tts:
+                    TTSModeSettingsTab()
                 case .models:
                     VoiceModelsTab()
                 }
@@ -70,8 +74,13 @@ struct VoiceView: View {
         .background(theme.primaryBackground)
         .environment(\.theme, themeManager.currentTheme)
         .onAppear {
-            // Auto-select appropriate tab based on setup state
-            if isSetupComplete {
+            // Honour an explicit cross-view request (e.g. from the chat speaker button).
+            if let requested = managementState.voiceSubTabRequest,
+                let tab = VoiceTab(rawValue: requested)
+            {
+                selectedTab = tab
+                managementState.voiceSubTabRequest = nil
+            } else if isSetupComplete {
                 selectedTab = .audioSettings
             } else {
                 selectedTab = .setup
@@ -79,6 +88,11 @@ struct VoiceView: View {
             withAnimation(.easeOut(duration: 0.25).delay(0.05)) {
                 hasAppeared = true
             }
+        }
+        .onChange(of: managementState.voiceSubTabRequest) { _, newValue in
+            guard let requested = newValue, let tab = VoiceTab(rawValue: requested) else { return }
+            selectedTab = tab
+            managementState.voiceSubTabRequest = nil
         }
     }
 

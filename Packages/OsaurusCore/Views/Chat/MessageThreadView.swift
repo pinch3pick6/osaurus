@@ -30,6 +30,7 @@ struct MessageThreadView: View {
     var onRegenerate: ((UUID) -> Void)? = nil
     var onEdit: ((UUID) -> Void)? = nil
     var onDelete: ((UUID) -> Void)? = nil
+    var onSpeak: ((UUID) -> Void)? = nil
 
     // Inline editing state (optional)
     var editingTurnId: UUID? = nil
@@ -88,6 +89,7 @@ struct MessageThreadView: View {
             onRegenerate: onRegenerate,
             onEdit: onEdit,
             onDelete: onDelete,
+            onSpeak: onSpeak,
             editingTurnId: editingTurnId,
             editText: editText,
             onConfirmEdit: onConfirmEdit,

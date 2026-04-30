@@ -377,3 +377,108 @@ public final class ClarifyTool: OsaurusTool, @unchecked Sendable {
         )
     }
 }
+
+// MARK: - speak
+
+/// Speak text aloud via PocketTTS. Fire-and-forget: returns the moment
+/// playback starts. The row spinner clears when audio drains.
+public final class SpeakTool: OsaurusTool, @unchecked Sendable {
+    public let name = "speak"
+    public let description =
+        "Read text aloud using the local text-to-speech engine. Use ONLY when the user explicitly "
+        + "asks to hear the response (`read this aloud`, `dictate this`, `speak`). Pass the exact "
+        + "prose to vocalize as plain text — no markdown, no code fences, no tool noise. Playback "
+        + "runs in the background; the user sees a spinner on the call until audio finishes."
+
+    public let parameters: JSONValue? = .object([
+        "type": .string("object"),
+        "additionalProperties": .bool(false),
+        "properties": .object([
+            "text": .object([
+                "type": .string("string"),
+                "description": .string(
+                    "Plain prose to speak aloud. Strip markdown/code; keep it conversational."
+                ),
+            ])
+        ]),
+        "required": .array([.string("text")]),
+    ])
+
+    public init() {}
+
+    public func execute(argumentsJSON: String) async throws -> String {
+        let argsReq = requireArgumentsDictionary(argumentsJSON, tool: name)
+        guard case .value(let args) = argsReq else { return argsReq.failureEnvelope ?? "" }
+
+        let textReq = requireString(
+            args,
+            "text",
+            expected: "non-empty plain prose to speak",
+            tool: name
+        )
+        guard case .value(let raw) = textReq else { return textReq.failureEnvelope ?? "" }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ToolEnvelope.failure(
+                kind: .invalidArgs,
+                message: "`text` must be a non-empty string.",
+                field: "text",
+                expected: "non-empty plain prose",
+                tool: name
+            )
+        }
+
+        // Respect the user's master TTS toggle.
+        let enabled = await MainActor.run { TTSConfigurationStore.load().enabled }
+        guard enabled else {
+            return ToolEnvelope.failure(
+                kind: .unavailable,
+                message:
+                    "Text-to-speech is disabled in settings. Tell the user to enable it under "
+                    + "Settings → Voice if they want spoken responses.",
+                tool: name,
+                retryable: false
+            )
+        }
+
+        // Outside chat (HTTP API), fall back to fresh ids — playback
+        // still works, just without the bubble/row UI binding.
+        let messageId = ChatExecutionContext.currentAssistantTurnId ?? UUID()
+        let callId = ChatExecutionContext.currentToolCallId ?? UUID().uuidString
+
+        do {
+            try await MainActor.run {
+                try TTSService.shared.startToolPlayback(
+                    text: trimmed,
+                    messageId: messageId,
+                    callId: callId
+                )
+            }
+        } catch TTSPlaybackError.modelNotReady {
+            return ToolEnvelope.failure(
+                kind: .unavailable,
+                message:
+                    "TTS model isn't loaded. User was prompted to download it — retry "
+                    + "once ready, or fall back to a text response.",
+                tool: name,
+                retryable: true
+            )
+        } catch {
+            return ToolEnvelope.fromError(error, tool: name)
+        }
+
+        // Past-tense label — the spinner conveys in-progress state.
+        return ToolEnvelope.success(tool: name, text: "Read aloud.")
+    }
+
+    /// Extract the trimmed `text` field. Returns nil when missing or
+    /// empty. Pure helper for tests.
+    public static func parse(argumentsJSON: String) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8),
+            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let raw = dict["text"] as? String
+        else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}

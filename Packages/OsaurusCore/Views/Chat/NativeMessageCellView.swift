@@ -33,6 +33,7 @@ struct CellRenderingContext {
     var onRegenerate: ((UUID) -> Void)? = nil
     var onEdit: ((UUID) -> Void)? = nil
     var onDelete: ((UUID) -> Void)? = nil
+    var onSpeak: ((UUID) -> Void)? = nil
     /// attachment or shared-artifact id string → full screen preview from ChatView
     var onUserImagePreview: ((String) -> Void)? = nil
 }
@@ -255,7 +256,6 @@ final class HeaderCircleActionControl: NSView {
 
     override func layout() {
         super.layout()
-        layer?.frame = bounds
         let side = min(bounds.width, bounds.height)
         layer?.cornerRadius = side > 0 ? side / 2 : 0
     }
@@ -301,23 +301,35 @@ final class NativeAssistantActionsView: NSView {
 
     private let copyButton: HeaderCircleActionControl
     private let regenerateButton: HeaderCircleActionControl
+    let speakButton: HeaderCircleActionControl
 
     private var turnId: UUID = UUID()
     private var onCopy: ((UUID) -> Void)?
     private var onRegenerate: ((UUID) -> Void)?
+    var onSpeak: ((UUID) -> Void)?
+
+    nonisolated(unsafe) private var ttsObservation: NSObjectProtocol?
+    nonisolated(unsafe) private var ttsConfigObservation: NSObjectProtocol?
+    private var currentTheme: (any ThemeProtocol)?
+    private var speakWidthConstraint: NSLayoutConstraint?
+    private var speakLeadingConstraint: NSLayoutConstraint?
 
     override init(frame: NSRect) {
         let copyControl = HeaderCircleActionControl(action: {})
         let regenControl = HeaderCircleActionControl(action: {})
+        let speakControl = HeaderCircleActionControl(action: {})
         self.copyButton = copyControl
         self.regenerateButton = regenControl
+        self.speakButton = speakControl
         super.init(frame: frame)
         translatesAutoresizingMaskIntoConstraints = false
 
         copyButton.translatesAutoresizingMaskIntoConstraints = false
         regenerateButton.translatesAutoresizingMaskIntoConstraints = false
+        speakButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(copyButton)
         addSubview(regenerateButton)
+        addSubview(speakButton)
 
         copyButton.setAction { [weak self] in
             guard let self else { return }
@@ -327,8 +339,18 @@ final class NativeAssistantActionsView: NSView {
             guard let self else { return }
             self.onRegenerate?(self.turnId)
         }
+        speakButton.setAction { [weak self] in
+            guard let self else { return }
+            self.onSpeak?(self.turnId)
+        }
 
         let size: CGFloat = 28
+        let speakLeading = speakButton.leadingAnchor.constraint(
+            equalTo: regenerateButton.trailingAnchor, constant: 4)
+        let speakWidth = speakButton.widthAnchor.constraint(equalToConstant: size)
+        self.speakLeadingConstraint = speakLeading
+        self.speakWidthConstraint = speakWidth
+
         NSLayoutConstraint.activate([
             copyButton.leadingAnchor.constraint(equalTo: leadingAnchor),
             copyButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -339,21 +361,58 @@ final class NativeAssistantActionsView: NSView {
             regenerateButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             regenerateButton.widthAnchor.constraint(equalToConstant: size),
             regenerateButton.heightAnchor.constraint(equalToConstant: size),
-            regenerateButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+
+            speakLeading,
+            speakButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            speakWidth,
+            speakButton.heightAnchor.constraint(equalToConstant: size),
+            speakButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
         ])
+
+        ttsObservation = NotificationCenter.default.addObserver(
+            forName: .ttsPlaybackStateChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.applyTTSVisibility()
+                self?.refreshSpeakIcon()
+            }
+        }
+        ttsConfigObservation = NotificationCenter.default.addObserver(
+            forName: .ttsConfigurationChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.applyTTSVisibility()
+            }
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let observation = ttsObservation {
+            NotificationCenter.default.removeObserver(observation)
+        }
+        if let observation = ttsConfigObservation {
+            NotificationCenter.default.removeObserver(observation)
+        }
+    }
 
     func configure(
         turnId: UUID,
         theme: any ThemeProtocol,
         onCopy: ((UUID) -> Void)?,
-        onRegenerate: ((UUID) -> Void)?
+        onRegenerate: ((UUID) -> Void)?,
+        onSpeak: ((UUID) -> Void)?
     ) {
         self.turnId = turnId
         self.onCopy = onCopy
         self.onRegenerate = onRegenerate
+        self.onSpeak = onSpeak
+        self.currentTheme = theme
 
         let pointSize = CGFloat(theme.captionSize) - 1
         let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
@@ -371,6 +430,37 @@ final class NativeAssistantActionsView: NSView {
             theme: theme,
             iconTint: nil
         )
+        applyTTSVisibility()
+        refreshSpeakIcon()
+    }
+
+    private func refreshSpeakIcon() {
+        guard let theme = currentTheme else { return }
+        let pointSize = CGFloat(theme.captionSize) - 1
+        let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
+        let isThisTurnPlaying = TTSService.shared.playingMessageId == turnId
+        let symbolName = isThisTurnPlaying ? "stop.fill" : "speaker.wave.2"
+        let tooltip = isThisTurnPlaying ? L("Stop") : L("Read aloud")
+        speakButton.setSymbol(
+            NSImage(systemSymbolName: symbolName, accessibilityDescription: tooltip)?
+                .withSymbolConfiguration(cfg),
+            toolTip: tooltip,
+            theme: theme,
+            iconTint: nil
+        )
+    }
+
+    private func applyTTSVisibility() {
+        let enabled = TTSConfigurationStore.load().enabled
+        // Hide only when the `speak` tool drove playback. manual
+        // taps keep the button so the stop swap stays available.
+        let toolDriven =
+            TTSService.shared.playingMessageId == turnId
+            && TTSService.shared.activeSpeakCallId != nil
+        let visible = enabled && !toolDriven
+        speakButton.isHidden = !visible
+        speakWidthConstraint?.constant = visible ? 28 : 0
+        speakLeadingConstraint?.constant = visible ? 4 : 0
     }
 }
 
@@ -757,6 +847,7 @@ final class NativeStatsView: NSView {
         ttft: TimeInterval?,
         tokensPerSecond: Double?,
         tokenCount: Int?,
+        unclosedReasoning: Bool = false,
         theme: any ThemeProtocol
     ) {
         var parts: [String] = []
@@ -772,6 +863,23 @@ final class NativeStatsView: NSView {
         }
         if let count = tokenCount {
             parts.append("\(count) tokens")
+        }
+        // Trailing diagnostic chip — vmlx tells us the model never emitted
+        // `</think>` (or the family's close tag) before EOS / max_tokens.
+        // Three observed scenarios all benefit from the same hint:
+        //   1. Reasoning-trained Qwen3.6-A3B / DSV4 fine-tunes loop on
+        //      validation prompts ("give me a 20-digit number") — answer
+        //      buried in reasoning; user should toggle the model's
+        //      "Disable Thinking" option for the next turn (verified live).
+        //   2. Gemma-4 / harmony-channel models capped early by
+        //      `max_tokens` — analysis channel didn't close; user should
+        //      raise the cap (verified live, gemma-4-e2b at 32 tok cap).
+        //   3. Any thinking model that emitted EOS while still in
+        //      reasoning — answer is in the pane above.
+        // Text intentionally does NOT name a specific toggle so the chip
+        // reads accurately for every model family.
+        if unclosedReasoning {
+            parts.append("⚠ thinking didn't close — answer may be in reasoning above")
         }
         label.stringValue = parts.joined(separator: " \u{2022} ")
         label.font = NSFont.monospacedDigitSystemFont(
@@ -961,11 +1069,12 @@ final class NativeMessageCellView: NSTableCellView {
         case let .preflightCapabilities(items):
             configureAsPreflight(block: block, items: items, context: context, sameKind: sameKind)
 
-        case let .generationStats(ttft, tokensPerSecond, tokenCount):
+        case let .generationStats(ttft, tokensPerSecond, tokenCount, unclosedReasoning):
             configureAsStats(
                 ttft: ttft,
                 tokensPerSecond: tokensPerSecond,
                 tokenCount: tokenCount,
+                unclosedReasoning: unclosedReasoning,
                 context: context,
                 sameKind: sameKind
             )
@@ -1091,14 +1200,24 @@ final class NativeMessageCellView: NSTableCellView {
             targetBg = nil
             targetRadius = 0
         }
-        if targetBg != nil { self.wantsLayer = true }
-        if !cgColorsEqual(lastBubbleBackgroundCGColor, targetBg) {
-            self.layer?.backgroundColor = targetBg
-            lastBubbleBackgroundCGColor = targetBg
-        }
-        if lastBubbleCornerRadius != targetRadius {
-            self.layer?.cornerRadius = targetRadius
-            lastBubbleCornerRadius = targetRadius
+        // sppress implicit CABasicAnimation on layer property mutations. Without this,
+        // every backgroundColor / cornerRadius change kicks off a 0.25s animation that
+        // continues compositing across frames during streaming
+        let bgChanged = !cgColorsEqual(lastBubbleBackgroundCGColor, targetBg)
+        let radiusChanged = lastBubbleCornerRadius != targetRadius
+        if targetBg != nil || bgChanged || radiusChanged {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if targetBg != nil { self.wantsLayer = true }
+            if bgChanged {
+                self.layer?.backgroundColor = targetBg
+                lastBubbleBackgroundCGColor = targetBg
+            }
+            if radiusChanged {
+                self.layer?.cornerRadius = targetRadius
+                lastBubbleCornerRadius = targetRadius
+            }
+            CATransaction.commit()
         }
 
         // always report height: configure() can return early when text is unchanged (e.g. tool row
@@ -1532,6 +1651,7 @@ final class NativeMessageCellView: NSTableCellView {
         ttft: TimeInterval?,
         tokensPerSecond: Double?,
         tokenCount: Int?,
+        unclosedReasoning: Bool,
         context: CellRenderingContext,
         sameKind: Bool
     ) {
@@ -1553,6 +1673,7 @@ final class NativeMessageCellView: NSTableCellView {
             ttft: ttft,
             tokensPerSecond: tokensPerSecond,
             tokenCount: tokenCount,
+            unclosedReasoning: unclosedReasoning,
             theme: context.theme
         )
     }
@@ -1582,7 +1703,8 @@ final class NativeMessageCellView: NSTableCellView {
             turnId: turnId,
             theme: context.theme,
             onCopy: context.onCopy,
-            onRegenerate: context.onRegenerate
+            onRegenerate: context.onRegenerate,
+            onSpeak: context.onSpeak
         )
     }
 

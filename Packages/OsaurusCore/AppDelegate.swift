@@ -90,6 +90,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         // Configure local notifications
         NotificationService.shared.configureOnLaunch()
 
+        // If PocketTTS models are already on disk, preload them so the first
+        // speaker tap plays immediately without routing to settings.
+        TTSService.shared.refreshModelState()
+
         // Set up observers for server state changes
         setupObservers()
 
@@ -394,6 +398,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
             object: nil
         )
 
+        // Route "user tapped speaker but model isn't ready" to the TTS settings tab.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOpenTTSSettings(_:)),
+            name: .openTTSSettingsRequested,
+            object: nil
+        )
+
         // Listen for chat view closed to resume VAD
         NotificationCenter.default.addObserver(
             self,
@@ -484,6 +496,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
     @objc private func handleShowManagement(_ notification: Notification) {
         Task { @MainActor in
             showManagementWindow()
+        }
+    }
+
+    @objc private func handleOpenTTSSettings(_ notification: Notification) {
+        Task { @MainActor in
+            ManagementStateManager.shared.voiceSubTabRequest = "TTS"
+            showManagementWindow(initialTab: .voice)
         }
     }
 
@@ -923,7 +942,32 @@ extension AppDelegate {
         }
     }
     fileprivate func handleDeepLink(_ url: URL) {
-        guard let scheme = url.scheme?.lowercased(), scheme == "huggingface" else { return }
+        let scheme = url.scheme?.lowercased() ?? ""
+        switch scheme {
+        case "osaurus":
+            handleOsaurusDeepLink(url)
+        case "huggingface":
+            handleHuggingFaceDeepLink(url)
+        default:
+            return
+        }
+    }
+
+    /// `osaurus://<addr>?pair=<base64url(invite)>` — incoming agent share link.
+    /// Stages the decoded invite for `IncomingPairSheet` to present.
+    fileprivate func handleOsaurusDeepLink(_ url: URL) {
+        Task { @MainActor in
+            // Make sure SOMETHING is on screen so the approval panel doesn't
+            // open behind a hidden app. Bring the management window forward
+            // as the anchor — it doesn't matter which tab is selected; the
+            // approval is presented as its own NSPanel via PairingPromptService.
+            NSApp.activate(ignoringOtherApps: true)
+            showManagementWindow(initialTab: .agents)
+            _ = PairingDeepLinkRouter.handle(url)
+        }
+    }
+
+    fileprivate func handleHuggingFaceDeepLink(_ url: URL) {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
         let items = components.queryItems ?? []
         let modelId = items.first(where: { $0.name.lowercased() == "model" })?.value?

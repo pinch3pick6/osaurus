@@ -81,6 +81,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
     let onRegenerate: ((UUID) -> Void)?
     let onEdit: ((UUID) -> Void)?
     let onDelete: ((UUID) -> Void)?
+    let onSpeak: ((UUID) -> Void)?
 
     // Inline editing state
     let editingTurnId: UUID?
@@ -204,6 +205,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             onRegenerate: onRegenerate,
             onEdit: onEdit,
             onDelete: onDelete,
+            onSpeak: onSpeak,
             onUserImagePreview: onUserImagePreview
         )
     }
@@ -226,6 +228,7 @@ struct MessageTableRepresentable: NSViewRepresentable {
             onRegenerate: onRegenerate,
             onEdit: onEdit,
             onDelete: onDelete,
+            onSpeak: onSpeak,
             onUserImagePreview: onUserImagePreview
         )
     }
@@ -325,6 +328,7 @@ extension MessageTableRepresentable {
             onRegenerate: nil,
             onEdit: nil,
             onDelete: nil,
+            onSpeak: nil,
             onUserImagePreview: nil
         )
 
@@ -359,7 +363,7 @@ extension MessageTableRepresentable {
         // MARK: Streaming Height Debounce
 
         private var streamingHeightWorkItem: DispatchWorkItem?
-        private let streamingHeightInterval: TimeInterval = 0.06
+        private let streamingHeightInterval: TimeInterval = 0.016
 
         // MARK: Minimap Tracking
 
